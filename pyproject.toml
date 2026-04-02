@@ -1,0 +1,6 @@
+[project]
+name = "ai-openai-pipeline"
+version = "1.0.0"
+description = "OpenAI pipeline — streaming chat, function calling, tool use, embeddings, structured output, conversation memory"
+requires-python = ">=3.11"
+dependencies = ["openai>=1.30.0","fastapi>=0.111.0","uvicorn>=0.30.0","pydantic>=2.7.0"]
