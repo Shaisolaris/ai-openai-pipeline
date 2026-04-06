@@ -1,5 +1,24 @@
 # ai-openai-pipeline
 
+> Production OpenAI pipeline: streaming chat, function calling with 5 tools, structured JSON output, embeddings with similarity search, conversation memory. FastAPI serving + pip installable.
+
+## Quick Start
+
+```bash
+pip install -e .
+export OPENAI_API_KEY=sk-...
+
+# Run examples
+python examples/01_basic_chat.py
+python examples/02_function_calling.py
+python examples/03_embeddings_similarity.py
+python examples/04_structured_output.py
+
+# Start API server
+python main.py
+# → http://localhost:8000/docs
+```
+
 OpenAI integration pipeline with streaming chat, function calling with 5 built-in tools, structured JSON output, text embeddings with cosine similarity, conversation memory with session management, and a FastAPI serving layer. Supports GPT-4o, tool chaining, and SSE streaming.
 
 ## Stack
