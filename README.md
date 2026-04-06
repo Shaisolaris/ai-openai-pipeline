@@ -1,5 +1,7 @@
 # ai-openai-pipeline
 
+![CI](https://github.com/Shaisolaris/ai-openai-pipeline/actions/workflows/ci.yml/badge.svg)
+
 > Production OpenAI pipeline: streaming chat, function calling with 5 tools, structured JSON output, embeddings with similarity search, conversation memory. FastAPI serving + pip installable.
 
 ## Quick Start
