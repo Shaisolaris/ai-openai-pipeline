@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
+import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable
 
+import redis
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
@@ -15,9 +19,33 @@ logger = logging.getLogger(__name__)
 client = AsyncOpenAI()
 
 
+class ConversationMemory(ABC):
+    """Abstract base class for managing conversation history."""
+
+    @abstractmethod
+    def add_user(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def add_assistant(self, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def add_tool_result(self, tool_call_id: str, content: str) -> None:
+        pass
+
+    @abstractmethod
+    def get_messages(self) -> list[ChatCompletionMessageParam]:
+        pass
+
+    @abstractmethod
+    def clear(self) -> None:
+        pass
+
+
 @dataclass
-class ConversationMemory:
-    """Manages conversation history with token-aware truncation."""
+class InMemoryConversationMemory(ConversationMemory):
+    """Manages conversation history in memory with token-aware truncation."""
 
     messages: list[ChatCompletionMessageParam] = field(default_factory=list)
     system_prompt: str = "You are a helpful assistant."
@@ -41,6 +69,9 @@ class ConversationMemory:
         self.messages.clear()
 
     def _truncate(self) -> None:
+        if len(self.messages) > self.max_messages:
+            self.messages = self.messages[-self.max_messages:]
+
         if len(self.messages) > self.max_messages:
             self.messages = self.messages[-self.max_messages:]
 
@@ -172,3 +203,110 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     norm_a = sum(x * x for x in a) ** 0.5
     norm_b = sum(x * x for x in b) ** 0.5
     return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+
+@dataclass
+class SQLiteConversationMemory(ConversationMemory):
+    """Manages conversation history using a SQLite database."""
+
+    db_path: str
+    conversation_id: str
+    system_prompt: str = "You are a helpful assistant."
+    ttl: int = 3600  # Time-to-live in seconds (1 hour)
+
+    def __post_init__(self):
+        self.conn = sqlite3.connect(self.db_path)
+        self._create_table()
+        self._enforce_ttl()
+
+    def _create_table(self):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_call_id TEXT,
+                timestamp REAL NOT NULL
+            )
+        """)
+        self.conn.commit()
+
+    def _enforce_ttl(self):
+        cursor = self.conn.cursor()
+        cutoff = time.time() - self.ttl
+        cursor.execute("DELETE FROM conversations WHERE timestamp < ?", (cutoff,))
+        self.conn.commit()
+
+    def add_user(self, content: str) -> None:
+        self._add_message("user", content)
+
+    def add_assistant(self, content: str) -> None:
+        self._add_message("assistant", content)
+
+    def add_tool_result(self, tool_call_id: str, content: str) -> None:
+        self._add_message("tool", content, tool_call_id)
+
+    def _add_message(self, role: str, content: str, tool_call_id: str | None = None) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO conversations (conversation_id, role, content, tool_call_id, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (self.conversation_id, role, content, tool_call_id, time.time()),
+        )
+        self.conn.commit()
+
+    def get_messages(self) -> list[ChatCompletionMessageParam]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT role, content, tool_call_id FROM conversations WHERE conversation_id = ? ORDER BY timestamp ASC",
+            (self.conversation_id,),
+        )
+        messages = [{"role": "system", "content": self.system_prompt}]
+        for role, content, tool_call_id in cursor.fetchall():
+            message = {"role": role, "content": content}
+            if tool_call_id:
+                message["tool_call_id"] = tool_call_id
+            messages.append(message)
+        return messages
+
+    def clear(self) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM conversations WHERE conversation_id = ?", (self.conversation_id,))
+        self.conn.commit()
+
+
+@dataclass
+class RedisConversationMemory(ConversationMemory):
+    """Manages conversation history using a Redis database."""
+
+    redis_url: str
+    conversation_id: str
+    system_prompt: str = "You are a helpful assistant."
+    ttl: int = 3600  # Time-to-live in seconds (1 hour)
+
+    def __post_init__(self):
+        self.redis = redis.from_url(self.redis_url)
+        self.key = f"conversation:{self.conversation_id}"
+
+    def add_user(self, content: str) -> None:
+        self._add_message({"role": "user", "content": content})
+
+    def add_assistant(self, content: str) -> None:
+        self._add_message({"role": "assistant", "content": content})
+
+    def add_tool_result(self, tool_call_id: str, content: str) -> None:
+        self._add_message({"role": "tool", "content": content, "tool_call_id": tool_call_id})
+
+    def _add_message(self, message: dict[str, Any]) -> None:
+        self.redis.rpush(self.key, json.dumps(message))
+        self.redis.expire(self.key, self.ttl)
+
+    def get_messages(self) -> list[ChatCompletionMessageParam]:
+        messages = [{"role": "system", "content": self.system_prompt}]
+        for message_json in self.redis.lrange(self.key, 0, -1):
+            messages.append(json.loads(message_json))
+        return messages
+
+    def clear(self) -> None:
+        self.redis.delete(self.key)
+
