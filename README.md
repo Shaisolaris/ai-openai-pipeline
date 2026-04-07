@@ -4,6 +4,9 @@
 
 > Production OpenAI pipeline: streaming chat, function calling with 5 tools, structured JSON output, embeddings with similarity search, conversation memory. FastAPI serving + pip installable.
 
+
+Production OpenAI pipeline with streaming chat, function calling, text embeddings, structured JSON output, and conversation memory. pip installable with 4 runnable examples.
+
 ## Quick Start
 
 ```bash
