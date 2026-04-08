@@ -5,10 +5,21 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Callable
+from typing import Any, AsyncGenerator, Callable, TYPE_CHECKING
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
+
+if TYPE_CHECKING:
+    from pipeline.persistence import SQLiteConversationStorage
+else:  # pragma: no cover
+    try:
+        from pipeline.persistence import SQLiteConversationStorage  # type: ignore
+    except ImportError:
+        class SQLiteConversationStorage:  # type: ignore[too-many-ancestors]
+            """Placeholder when persistence module is unavailable."""
+
+            ...
 
 logger = logging.getLogger(__name__)
 
@@ -22,27 +33,131 @@ class ConversationMemory:
     messages: list[ChatCompletionMessageParam] = field(default_factory=list)
     system_prompt: str = "You are a helpful assistant."
     max_messages: int = 50
+    storage_backend: SQLiteConversationStorage | None = None
+    conversation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.storage_backend and not self.messages:
+            stored_messages = self._load_from_backend()
+            if stored_messages:
+                self.messages = list(stored_messages)
+                self._truncate()
 
     def add_user(self, content: str) -> None:
-        self.messages.append({"role": "user", "content": content})
-        self._truncate()
+        self.add_message({"role": "user", "content": content})
 
     def add_assistant(self, content: str) -> None:
-        self.messages.append({"role": "assistant", "content": content})
-        self._truncate()
+        self.add_message({"role": "assistant", "content": content})
 
     def add_tool_result(self, tool_call_id: str, content: str) -> None:
-        self.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})
+        self.add_message({"role": "tool", "tool_call_id": tool_call_id, "content": content})
+
+    def add_message(self, message: ChatCompletionMessageParam) -> None:
+        self.messages.append(message)
+        self._truncate()
+        self._save_to_backend()
+
+    def get_conversation(self) -> list[ChatCompletionMessageParam]:
+        if not self.messages:
+            stored_messages = self._load_from_backend()
+            if stored_messages:
+                self.messages = list(stored_messages)
+                self._truncate()
+        return self.messages
 
     def get_messages(self) -> list[ChatCompletionMessageParam]:
-        return [{"role": "system", "content": self.system_prompt}, *self.messages]
+        conversation = self.get_conversation()
+        return [{"role": "system", "content": self.system_prompt}, *conversation]
 
     def clear(self) -> None:
         self.messages.clear()
+        self._save_to_backend()
 
     def _truncate(self) -> None:
         if len(self.messages) > self.max_messages:
             self.messages = self.messages[-self.max_messages:]
+
+    def _resolve_storage_callable(self, *names: str) -> Callable[..., Any] | None:
+        if not self.storage_backend:
+            return None
+        for name in names:
+            handler = getattr(self.storage_backend, name, None)
+            if callable(handler):
+                return handler
+        return None
+
+    def _load_from_backend(self) -> list[ChatCompletionMessageParam] | None:
+        loader = self._resolve_storage_callable("load", "load_conversation", "get_conversation")
+        if not loader:
+            if self.storage_backend:
+                logger.warning("Storage backend %s does not expose a load method.", type(self.storage_backend).__name__)
+            return None
+
+        attempts: list[tuple[Any, ...]] = []
+        if self.conversation_id is not None:
+            attempts.append((self.conversation_id,))
+        attempts.append(tuple())
+
+        for args in attempts:
+            try:
+                result = loader(*args)
+                if result is None:
+                    return None
+                if isinstance(result, list):
+                    return result
+                return list(result)
+            except TypeError:
+                continue
+            except Exception:
+                logger.exception("Failed to load conversation from storage backend.")
+                return None
+
+        if self.conversation_id is None:
+            logger.warning(
+                "Storage backend %s requires a conversation identifier; provide `conversation_id` when creating ConversationMemory.",
+                type(self.storage_backend).__name__ if self.storage_backend else "unknown",
+            )
+        else:
+            logger.warning(
+                "Storage backend %s load callable signature unsupported; skipping load.",
+                type(self.storage_backend).__name__,
+            )
+        return None
+
+    def _save_to_backend(self) -> None:
+        saver = self._resolve_storage_callable("save", "save_conversation", "put_conversation")
+        if not saver:
+            if self.storage_backend:
+                logger.warning("Storage backend %s does not expose a save method; skipping persistence.", type(self.storage_backend).__name__)
+            return
+
+        attempts: list[tuple[Any, ...]] = []
+        if self.conversation_id is not None:
+            attempts.append((self.conversation_id, self.messages))
+            attempts.append((self.conversation_id,))
+        attempts.append((self.messages,))
+        attempts.append(tuple())
+
+        for args in attempts:
+            try:
+                saver(*args)
+                return
+            except TypeError:
+                continue
+            except Exception:
+                logger.exception("Failed to save conversation to storage backend.")
+                return
+
+        if self.conversation_id is None:
+            logger.warning(
+                "Storage backend %s requires a conversation identifier; provide `conversation_id` when creating ConversationMemory.",
+                type(self.storage_backend).__name__ if self.storage_backend else "unknown",
+            )
+        else:
+            logger.warning(
+                "Storage backend %s save callable signature unsupported; skipping persistence.",
+                type(self.storage_backend).__name__,
+            )
 
 
 @dataclass
